@@ -1,3 +1,4 @@
+#!/usr/bin/perl
 use strict;
 use Data::Dumper;
 use Carp;
@@ -23,10 +24,11 @@ use File::Temp;
 ## P R O C E S S   R U N N I N G
 ##
 sub backtick {
-    my ($command) = @_;
+    my ($command, %opts) = @_;
     my @lines = `$command`;
     if ($?) {
-        confess "Failed '$command': $!";
+        confess "Failed '$command': $!" unless $opts{noexit};
+        return ();
     }
     chomp(@lines);
     return @lines;
@@ -44,7 +46,7 @@ sub run {
 ##
 my @gMajorScale = (2, 2, 1, 2, 2, 2, 1);
 my @gNoteSymbols = qw/ C   C#  D  D#  E   F   F#  G  G#  A A# B  /;
-my $gCsvMidiPath = "foo";
+my $gCsvMidiPath = "/Users/pete/midiGen/midicsv-1.1/csvmidi";
 
 ## Parses notes of the form
 ##    C2
@@ -62,9 +64,8 @@ sub text2Note {
     die "text2Note got a bunk note: '$text'" unless $text =~ /([^\d]+)([-+]?\d)/;
 
     my $l = uc($1);
-    $l =~ s/s/#/; ## We accept s for # -- so it's nicer to work with on command line
+    $l =~ s/S/#/; ## We accept s for # -- so it's nicer to work with on command line
     (my $n = $2) =~ s/^\+//;
-    
     my $offset = -1;
     for (my $i = 0; $i < @gNoteSymbols; $i++){
         if ($gNoteSymbols[$i] eq $l){
@@ -77,6 +78,14 @@ sub text2Note {
     confess "INTERNAL ERROR [2]: bad note" unless $note >= 0 && $note < 128;
 
     return $note;
+}
+
+sub note2Text {
+    my ($note) = @_;
+    my $noteLetter = $gNoteSymbols[$note % 12];
+    my $noteOctave = int($note / 12) - 2;
+    $noteLetter =~ s/\#/s/;
+    return "${noteLetter}$noteOctave";
 }
 
 sub incrementNoteBasedOnScaleDegree {
@@ -95,13 +104,31 @@ sub tonicScaleDegreeFromKeyAndTonic {
     if ($keyNote > $tonicNote) {
         $tonicNote += 12;
     }
-    return $tonicNote - $keyNote + 1;
+
+    my $note = $keyNote;
+    for (my $i = 0; $i < @gMajorScale; $i++) {
+        if ($note == $tonicNote) {
+            return $i+1;
+        }
+        $note += $gMajorScale[$i];
+    }
+    confess "Failed tonicScaleDegreeFromKeyAndTonic unexpectedly";
+}
+
+sub keyAndTonicAgree {
+    my ($keyText, $tonicText, $keyNote, $tonicNote) = @_;
+    eval {
+        tonicScaleDegreeFromKeyAndTonic($keyNote, $tonicNote);
+        return;
+    };
+    if ($@) {
+        confess "Key $keyText and tonic $tonicText do not align";
+    }
 }
 
 sub scaleFromTonic {
     my ($keyNote, $tonicNote, $nnotes) = @_;
     my $tonicScaleDegree = tonicScaleDegreeFromKeyAndTonic($keyNote, $tonicNote);
-    
     my $note = $tonicNote; 
     my @notes;
     for (my $i = 0; $i < $nnotes; $i++) {
@@ -161,9 +188,10 @@ sub commandNoteRange {
     confess "Note enough arguments to noteRange" unless defined($keyText) && defined($tonicText);
     my $keyNote   = text2Note($keyText);
     my $tonicNote = text2Note($tonicText);
+    keyAndTonicAgree($keyText, $tonicText, $keyNote, $tonicNote);
     $velocity      = 90 unless defined($velocity);
     confess "Bad velocity argument to noteRange '$velocity'" 
-        unless $velocity =~ /^\d$/ && $velocity > 0 && $velocity < 128;
+        unless ($velocity =~ /^\d+$/ && $velocity > 0 && $velocity < 128);
     $framesOfNotes = 2 unless defined($framesOfNotes);
     confess "Bad argument to noteRange for framesOfNotes '$framesOfNotes'"
         unless ($framesOfNotes =~ /^\d+$/ || $framesOfNotes < 1 || $framesOfNotes > 7);
@@ -181,8 +209,8 @@ sub commandNoteRange {
             print "noteRange ran out of notes\n";
             return;
         }
-
-        my $fname = "output/${leftTag}${rightTag}.${row}x${col}_n${keyText}_${tonicText}.mid";
+        my $noteText = note2Text($notes[$i]);
+        my $fname = "output/${leftTag}${rightTag}.${row}x${col}_n${noteText}.mid";
         emitNote($notes[$i], $velocity, $duration, $fname);
 
         $col++;
@@ -230,9 +258,12 @@ sub commandRenameFreeze {
 ## Utilities
 ##
 sub removeTagged {
-    my @list = grep {/^[A-Z][A-Z]\./} map { s/^output\/// } backtick("ls output/*.mid output/*.wav");
-    print "@list\n";
-    # unlink @list;
+    my @list = grep {/^[A-Z][A-Z]\./} 
+                map { s/^output\///; $_ } (backtick("ls output/*.mid 2> /dev/null", noexit=>1),
+                                           backtick("ls output/*.wav 2> /dev/null", noexit=>1));
+    for (@list) {
+        unlink "output/$_";
+    }
 }
 
 
@@ -243,6 +274,7 @@ my %gCommands = (
 
 sub main {
     my ($command, @args) = @ARGV;
+
     confess "Requires 1 argument" unless defined($command);
     confess "Unknown command" unless defined($gCommands{$command});
 
@@ -256,3 +288,5 @@ sub main {
     ## Run the command
     $gCommands{$command}(@args);
 }
+
+main();
