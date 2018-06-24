@@ -3,6 +3,7 @@ use strict;
 use Data::Dumper;
 use Carp;
 use File::Temp;
+use YAML;
 
 ##
 ## D O C U M E N T A T I O N
@@ -17,14 +18,16 @@ use File::Temp;
 ##          Db5
 ## Commands:
 ##      ## Create a range of in-key notes
-##      noteRange <Key-Note> <Tonic-Note> [Velocity:90] [numberOfFrames:2] [Duration:4*960]
+##      noteRange <Key-Note> <Tonic-Note> [Velocity:90] [numberOfFrames:1] [Duration:4*960]
 ##      renameFreeze
 ## Examples:
 ##      noteRange G3 F
 ## P R O C E S S   R U N N I N G
 ##
+my $gVerbose = 1;
 sub backtick {
     my ($command, %opts) = @_;
+    print "$command\n" if $gVerbose;
     my @lines = `$command`;
     if ($?) {
         confess "Failed '$command': $!" unless $opts{noexit};
@@ -36,6 +39,7 @@ sub backtick {
 
 sub run {
     my ($cmd) = @_;
+    print "$cmd\n" if $gVerbose;
     if (system $cmd){
         confess "Failed: '$cmd': $!";
     }
@@ -46,7 +50,9 @@ sub run {
 ##
 my @gMajorScale = (2, 2, 1, 2, 2, 2, 1);
 my @gNoteSymbols = qw/ C   C#  D  D#  E   F   F#  G  G#  A A# B  /;
-my $gCsvMidiPath = "/Users/pete/midiGen/midicsv-1.1/csvmidi";
+my $gMidiCsvPath = "/Users/pete/midiGen/midicsv-1.1/midicsv";
+my $gSoxPath     = "/Users/pete/midiGen/sox-14.4.2/sox";
+my $gFlagPitch   = 0;
 
 ## Parses notes of the form
 ##    C2
@@ -167,7 +173,7 @@ sub rawMidiEmit {
     print {$fd} join(', ', $track, $latestTime, 'End_track'), "\n";
     print {$fd} join(', ', 0, 0, 'End_of_file'), "\n";
     close($fd);
-    run "$gCsvMidiPath $filename > $outputFile";
+    run "$gMidiCsvPath $filename > $outputFile";
     unlink $filename;
 }
 
@@ -178,6 +184,85 @@ sub emitNote {
         [$duration, "Note_off_c", $note, 0],
     );
     rawMidiEmit(\@midi, $fileName);
+}
+
+## 
+## C O M P U T E    S A M P L E    B O U N D A R I E S
+##
+## NOTE: all times from this method are measured in seconds.
+sub computeSampleBoundaries {
+    my ($inputMidiFile, $bpm) = @_;
+    my $secondsPerQuarterNote = 60.0/$bpm;
+    my $ppqn;
+    my (@flagTimes, @noteStarts);
+
+    my @lines = backtick("$gMidiCsvPath $inputMidiFile");
+    chomp(@lines);
+    
+    for my $line (@lines) {
+        my @fields = split ",", $line;
+        for (@fields) {
+            s/^\s*//;
+            s/\s*$//;
+        }
+        my $command = $fields[2];
+        if ($command eq 'Header') {
+            $ppqn = $fields[5];
+        } elsif ($command eq 'Note_on_c') {
+            my (undef, $ticks, $command, $channel, $pitch, $velocity) = @fields;
+            if ($velocity != 0) {
+                confess "Unable to find ppqn in file $inputMidiFile" unless defined($ppqn);
+                my $time = ($ticks/$ppqn)*$secondsPerQuarterNote;
+                if ($pitch == $gFlagPitch) {
+                    push @flagTimes, $time;
+                } else {
+                    push @noteStarts, $time;
+                }
+            }
+        }
+    }
+
+    confess "Failed to find any flag notes in $inputMidiFile" unless @flagTimes > 0;
+    printf("Processing %d samples\n", scalar(@flagTimes)) if $gVerbose;
+
+    my @sampleBoundaries;
+    while (@flagTimes > 0 && @noteStarts > 0) {
+        my $flag = shift @flagTimes;
+        while (@noteStarts > 0) {
+            my $time = shift @noteStarts;
+            if ($time >= $flag) {
+                push @sampleBoundaries, $time;
+                last;
+            }
+        }
+    }
+    confess "Unmatched flagTimes found" if @flagTimes > 0 && @noteStarts == 0;
+    return \@sampleBoundaries;
+}
+
+##
+## S P L I T   A U D I O   F I L E
+##
+sub splitAudioFile {
+    my ($inputWavFile, $sampleBoundaries, $outputDir) = @_;
+    my @boundaries = @$sampleBoundaries;
+    my $timeStamp = time;
+    my @letters = ('A' .. 'Z');
+    my $count = 0;
+    my $sourceTag = $inputWavFile;
+    $sourceTag =~ s/\.wav$//;
+    $sourceTag =~ s/^input\///;
+    my $nboundaries = scalar(@$sampleBoundaries);
+    for (my $i = 0; $i < $nboundaries; $i++) {
+        my $start = $boundaries[$i]; 
+        my $duration = "";
+        if ($i+1 < $nboundaries) {
+            $duration = $boundaries[$i+1] - $start;
+        }
+        my $orderTag = $letters[$i / 26] . $letters[$i % 26];
+        my $outputWavFile = "$outputDir/$timeStamp.$orderTag.$sourceTag.wav";
+        run "$gSoxPath $inputWavFile $outputWavFile trim $start $duration";
+    }
 }
 
 ##
@@ -192,7 +277,7 @@ sub commandNoteRange {
     $velocity      = 90 unless defined($velocity);
     confess "Bad velocity argument to noteRange '$velocity'" 
         unless ($velocity =~ /^\d+$/ && $velocity > 0 && $velocity < 128);
-    $framesOfNotes = 2 unless defined($framesOfNotes);
+    $framesOfNotes = 1 unless defined($framesOfNotes);
     confess "Bad argument to noteRange for framesOfNotes '$framesOfNotes'"
         unless ($framesOfNotes =~ /^\d+$/ || $framesOfNotes < 1 || $framesOfNotes > 7);
     my $duration = 4*960;
@@ -206,7 +291,7 @@ sub commandNoteRange {
         my $rightTag = $letters[$i % 26];
 
         if ($i >= @notes) {
-            print "noteRange ran out of notes\n";
+            printf "noteRange ran out of notes $i (%d)\n", 16*$framesOfNotes;
             return;
         }
         my $noteText = note2Text($notes[$i]);
@@ -254,6 +339,27 @@ sub commandRenameFreeze {
     }
 }
 
+sub commandSplitKit {
+    my ($tag) = @_;
+    $tag =~ s/^input\///;
+    $tag =~ s/\.$//;
+    my $inputYamlFile = "input/$tag.yaml";
+    my $inputMidiFile = "input/$tag.mid";
+    my $inputWavFile  = "input/$tag.wav";
+    
+    confess "Couldn't find input json file $inputYamlFile" unless -f $inputYamlFile;
+    confess "Couldn't find input midi file $inputMidiFile" unless -f $inputMidiFile;
+    confess "Couldn't find input wav file $inputWavFile" unless -f $inputWavFile;
+
+    my $conf = YAML::LoadFile($inputYamlFile);
+    my $bpm  = $conf->{bpm};
+    confess "Config file $inputYamlFile did NOT correctly define mandatory config option bpm" 
+        unless defined($bpm) && $bpm > 20 && $bpm < 180;
+
+    my $boundaries = computeSampleBoundaries($inputMidiFile, $bpm);
+    splitAudioFile($inputWavFile, $boundaries, "output");
+}
+
 ##
 ## Utilities
 ##
@@ -270,6 +376,7 @@ sub removeTagged {
 my %gCommands = (
     noteRange => \&commandNoteRange,
     renameFreeze => \&commandRenameFreeze,
+    splitKit => \&commandSplitKit,
 );
 
 sub main {
